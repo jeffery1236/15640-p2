@@ -50,15 +50,17 @@ package rpc
 //   pass svc to srv.AddService()
 //
 
-import "encoding/gob"
-import "bytes"
-import "fmt"
-import "reflect"
-import "sync"
-import "log"
-import "strings"
-import "math/rand"
-import "time"
+import (
+	"bytes"
+	"encoding/gob"
+	"fmt"
+	"log"
+	"math/rand"
+	"reflect"
+	"strings"
+	"sync"
+	"time"
+)
 
 type reqMsg struct {
 	endname  interface{} // name of sending ClientEnd
