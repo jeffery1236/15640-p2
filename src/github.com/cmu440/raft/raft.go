@@ -48,13 +48,13 @@ import (
 const kEnableDebugLogs = true
 
 // Set to true to log to stdout instead of file
-const kLogToStdout = true
+const kLogToStdout = false
 
 // Change this to output logs to a different directory
 const kLogOutputDir = "./raftlogs/"
 
 const NULL_INT = -99999 // NULL value for int types
-const MAX_NUM_LOG_ENTRIES = 1000
+const MAX_ARG_LOG_ENTRIES = 20
 
 const max_election_timeout = 600 // in ms
 const min_election_timeout = 400
@@ -141,53 +141,213 @@ type Raft struct {
 	/* Volatile states for Leader END */
 }
 
-/* Raft should maintain 2 properties
-1. If 2 entries in diff logs have the same index and term -> command must be the same
-2. If 2 entries in diff logs have the same index and term -> all prev entries are the same
-*/
-
-/*
-On receive_AppendEntries -> Consistency Check:
-if rf.log_entries[args.PrevLogIndex] != args.PrevLogTerm {
-	return False // Leader will decrement nextIndex for this F
+func printLogs(me int, log_entries []LogEntry, rf *Raft) {
+	rf.logger.Println("rf", me, ": Printing logs |")
+	for i, log := range log_entries{
+		// log := log_entries[i]
+		rf.logger.Println("rf", me, "|", i, "| index", log.Index, "term:", log.Term, "command:", log.Command)
+	}
+	rf.logger.Println(me, ": Print logs END |")
 }
-else { // Consistency Check passed -> time to update my logs to match leader
-	for leader_entry, my_entry in zip(args.Entries, rf.log_entries[args.PrevLogIndex + 1: ]) {
-		if leader_entry.Term != my_entry.Term {
-			// discard my logs starting from this entry onwards
 
-			// Append leader's entry and all that follows
+func get_last_log_id(rf *Raft) int {
+	var last_log_id int
+	rf.mux.Lock()
+	if len(rf.log_entries) == 0 {
+		last_log_id = NULL_INT
+	} else {
+		last_log_id = rf.log_entries[rf.num_logs - 1].Index
+		if last_log_id != rf.num_logs {
+			rf.logger.Panicln("last_log_id != rf.num_logs")
 		}
 	}
+	rf.mux.Unlock()
 
-	If leaderCommit > commitIndex {
-		// Synchronize state machine with Leader's
+	return last_log_id
+}
 
-		rf.commit_index = min(args.LeaderCommit, len(rf.log_entries) - 1)
-
-		for i := rf.lastApplied + 1; i <= rf.commit_index; i++ {
-			Apply command in rf.log_entries[i]
+func get_last_log_term(rf *Raft) int {
+	var last_log_term int
+	rf.mux.Lock()
+	if len(rf.log_entries) == 0 {
+		last_log_term = NULL_INT
+	} else {
+		last_log_id := rf.log_entries[rf.num_logs - 1].Index
+		if last_log_id != rf.num_logs {
+			rf.logger.Panicln("last_log_id != rf.num_logs")
 		}
+		last_log_term = rf.log_entries[rf.num_logs - 1].Term
+	}
+	rf.mux.Unlock()
 
-		rf.last_applied = rf.commit_index
+	return last_log_term
+}
+
+func get_upToDate_check(args RequestVoteArgs, rf *Raft) bool {
+	last_log_id := get_last_log_id(rf)
+	var my_last_log_term int
+	if last_log_id == NULL_INT { // my logs are empty
+		my_last_log_term = NULL_INT
+	} else {
+		rf.mux.Lock()
+		my_last_log_term = rf.log_entries[last_log_id - 1].Term
+		rf.mux.Unlock()
+	}
+
+	rf.logger.Println("Up-to-date check. Arg-lastLogIndex:", args.Last_log_index, "Arg-lastLogTerm", args.Last_log_term, "myLastLogIndex", last_log_id, "myLastLogTerm:", my_last_log_term)
+
+	if args.Last_log_term == NULL_INT && my_last_log_term == NULL_INT {
+		// both candidate and receiver's logs are empty
+		return true
+	}
+
+	if args.Last_log_term > my_last_log_term {
+		return true // Candidate is more up-to-date
+	} else if args.Last_log_term == my_last_log_term {
+		// Check to see whose logs is longer
+		if args.Last_log_index > last_log_id {
+			return true // Candidate is more up-to-date
+		} else if args.Last_log_index < last_log_id {
+			return false // i am more up-to-date
+		} else {
+			rf.logger.Println("Weird case: args.LastLogIndex == last_log_id", args.Last_log_index, last_log_id)
+			return true
+		}
+	} else {
+		return false // i am more up-to-date
 	}
 }
 
-On receive AppendEntries response:
+func HandleAppendEntry(me int, term int, args *AppendEntriesArgs, reply *AppendEntriesReply, rf *Raft) {
+	if args.Is_heartbeat == false {
+		//  Actual Log update //
+		rf.mux.Lock()
+		var my_prev_log_id int
+		var my_prev_log_term int
+		if args.Prev_log_index != NULL_INT && len(rf.log_entries) >= args.Prev_log_index {
+			my_prev_log_entry := &rf.log_entries[args.Prev_log_index - 1]
+			my_prev_log_id = my_prev_log_entry.Index
+			my_prev_log_term = my_prev_log_entry.Term
+		} else {
+			// my_log_prev_log_id = nil
+			my_prev_log_id = NULL_INT
+			my_prev_log_term = NULL_INT
+		}
+		rf.mux.Unlock()
 
+		/* Consistency Check */
+		if (my_prev_log_id == NULL_INT && args.Prev_log_index == NULL_INT) || (my_prev_log_id == args.Prev_log_index && my_prev_log_term == args.Prev_log_term) {
+			/* Consistency Check passed
+			1. Check for Conflicts and discard
+			2. Update Commit_index
+			3. for-loop over log_entries and apply commands
+			4. Reply Success
+			*/
+			rf.mux.Lock()
+			log_entries := rf.log_entries
+			num_logs := rf.num_logs
 
-On receive RequestVotes -> up-to-date check:
-if args.LastLogTerm > rf.log_entries[-1].term {
-	// Candidate is more up-to-date
+			if args.Prev_log_index != NULL_INT {
+				rf.logger.Println(me, "Checking for conflicts", len(args.Log_entries), "args.Prev_log_index", args.Prev_log_index)
+				// printLogs(me , args.Log_entries[:])
+					// rf.logger.Println(me, "args.Prev_log_index", args.Prev_log_index)
+				// 1. Check for Conflicts and discard
+				i := 0
+				for {
+					my_log_0_id := i + args.Prev_log_index
+					if my_log_0_id >= num_logs {
+						// reached the end of my logs
+						// for j := i; j < len(args.Log_entries); j++ {
+						// 		rf.logger.Println(me, "log appending", j, "index:", args.Log_entries[j].Index, "term:", args.Log_entries[j].Term)
+						// 	log_entries = append(log_entries, args.Log_entries[j])
+						// } // Append leader's entry and all that follows
+						log_entries = append(log_entries, args.Log_entries[i:]...)
+						break
+					}
+					// rf.logger.Println(me, "F passed consistencyCheck my_log_0_id", my_log_0_id, "Prev_log_index", args.Prev_log_index, "term", term)
 
-} else if args.LastLogTerm == rf.log_entries[-1].term {
-	// Check to see whose logs is longer
-	num_logs = len
-	my_lastLogIndex =
-} else {
+					// Check for Conflicts
+					if log_entries[my_log_0_id].Term != args.Log_entries[i].Term {
+						log_entries = log_entries[:my_log_0_id] // discard my logs starting from this entry
 
+						// for j := i; j < len(args.Log_entries); j++ {
+						// 		rf.logger.Println(me, "log appending", j, "index:", args.Log_entries[j].Index, "term:", args.Log_entries[j].Term)
+						// 	log_entries = append(log_entries, args.Log_entries[j])
+						// } // Append leader's entry and all that follows
+						log_entries = append(log_entries, args.Log_entries[i:]...)
+						break
+					}
+
+					i += 1
+				} //
+			} else {
+				// for j := 0; j < len(args.Log_entries); j++ {
+				// 		rf.logger.Println(me, "log appending", j, "index:", args.Log_entries[j].Index, "term:", args.Log_entries[j].Term)
+				// 	log_entries = append(log_entries, args.Log_entries[j])
+				// } // Append leader's entry and all that follows
+				// rf.logger.Println(me, "leader:", args.Leader_id, "args.Prev_log_index is null", len(args.Log_entries), "args.Prev_log_index", args.Prev_log_index)
+				log_entries = append(log_entries, args.Log_entries...)
+			}
+
+			num_logs = len(log_entries)
+			if num_logs != log_entries[num_logs - 1].Index {
+					// printLogs(me, log_entries)
+				// rf.logger.Println(me, "")
+				rf.logger.Panicln("Error in", me, "F receive AppendEntries: num_logs != log_entries[num_logs - 1].Index", num_logs, log_entries[num_logs - 1].Index)
+			}
+			rf.log_entries = log_entries
+			rf.num_logs = len(log_entries)
+			rf.mux.Unlock()
+
+			// 2. Update commit index to min(leaderCommit, index of last new entry)
+			if args.Leader_commit_id > rf.commit_index {
+				if args.Leader_commit_id > num_logs {
+					// rf.logger.Println(me, "updating commit_index with num_logs", num_logs, "rf.commit_index", rf.commit_index, "num_logs", num_logs)
+					rf.commit_index = num_logs
+				} else {
+					// rf.logger.Println(me, "updating commit_index with args.Leader_commit_id", "rf.commit_index", rf.commit_index, "args.Leader_commit_id", args.Leader_commit_id)
+					rf.commit_index = args.Leader_commit_id
+				}
+			} else {
+				// rf.logger.Println(me, "args.Leader_commit_id < rf.commit_index updating commit_index with num_logs", num_logs, "rf.commit_index", rf.commit_index, "args.Leader_commit_id", args.Leader_commit_id)
+				rf.commit_index = num_logs
+			}
+
+			// 3. for-loop over log_entries and apply commands
+			if rf.commit_index > rf.last_applied {
+				for i := rf.last_applied; i < rf.commit_index; i++ {
+					log := log_entries[i]
+					apply_command := &ApplyCommand{log.Index, log.Command}
+					rf.logger.Println(me, "APPLYING COmmand, index:", log.Index, "term:", log.Term, "Command:", log.Command)
+					rf.applyCh <- *apply_command
+				}
+				rf.last_applied = rf.commit_index
+			} //
+			// printLogs(me, log_entries)
+
+			// 4. Reply Success
+			reply.New_match_id = rf.commit_index
+			reply.Success = true
+			reply.Term = args.Term //
+		} else {
+			reply.Success = false // Consistency Check fails
+			reply.Term = args.Term
+		}
+		reply.Is_heartbeat = false
+		/* Consistency Check END */
+
+	} else {
+		// Regular HeartBeat response to args.Term >= term
+		reply.Is_heartbeat = true
+		reply.New_match_id = NULL_INT
+		reply.Success = true
+		reply.Term = args.Term
+	}
+
+	reply.From = me
+	// rf.logger.Println(me, "replying leader:", args.Leader_id, "match_ID", reply.New_match_id, "rf.commit_index", rf.commit_index, "rf.num_logs", rf.num_logs)
+	rf.appendEntries_reply_chan <- *reply
 }
-*/
 
 func getRandomTime() time.Duration{
 	timeout_duration := rand.Intn(max_election_timeout - min_election_timeout) + min_election_timeout
@@ -196,10 +356,10 @@ func getRandomTime() time.Duration{
 
 func (rf *Raft) followerRoutine(term int, voted_candidate_leader int) {  // Main Routine
 	rf.mux.Lock()
-	// fmt.Println(rf.me, "just became follower term:", term)
+	rf.logger.Println(rf.me, "just became follower term:", term)
 	rf.server_state = 1
 	rf.current_term = term
-	// me := rf.me
+	me := rf.me
 	rf.mux.Unlock()
 	// rf.voted_candidate_leader = voted_candidate_leader
 	var ticker *time.Ticker
@@ -207,7 +367,7 @@ func (rf *Raft) followerRoutine(term int, voted_candidate_leader int) {  // Main
 	for {
 		select {
 		case args := <- rf.received_requestVote_chan:
-			// fmt.Println(rf.me, "F RequestVote received, term:", args.Term, args.Candidate_id)
+			// rf.logger.Println(rf.me, "F RequestVote received, term:", args.Term, args.Candidate_id)
 			reply := &RequestVoteReply{}
 
 			if args.Term < term {
@@ -216,19 +376,23 @@ func (rf *Raft) followerRoutine(term int, voted_candidate_leader int) {  // Main
 				reply.Vote_granted = false
 				reply.Voted_for = NULL_INT
 				rf.requestVote_reply_chan <- *reply
+				rf.logger.Println(args.Candidate_id, "RequestVote reply from", me, "F falied-lowerTerm, args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
 
 			} else if args.Term == term {
-				if (voted_candidate_leader == NULL_INT || voted_candidate_leader == args.Candidate_id) {
+				if (voted_candidate_leader == NULL_INT || voted_candidate_leader == args.Candidate_id) && get_upToDate_check(args, rf) {
 					// Replace && true with candidate’s log is at least as up-to-date as receiver's log
 
 					voted_candidate_leader = args.Candidate_id
 
 					reply.Term = args.Term
 					reply.Vote_granted = true
+					rf.logger.Println(args.Candidate_id, "RequestVote reply from", me, "F success-voteForFirstEqualTerm, args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
 				} else {
 					reply.Term = args.Term
 					reply.Vote_granted = false // Alr voted for another peer or log is invalid
 					reply.Voted_for = voted_candidate_leader
+
+					rf.logger.Println(args.Candidate_id, "RequestVote reply from", me, "F falied-alreadyVotedEqualTerm, args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
 				}
 				rf.requestVote_reply_chan <- *reply
 			} else {
@@ -238,13 +402,20 @@ func (rf *Raft) followerRoutine(term int, voted_candidate_leader int) {  // Main
 				// rf.voted_for = args.Candidate_id
 
 				reply.Term = args.Term
-				reply.Vote_granted = true
+				if get_upToDate_check(args, rf) == true {
+					reply.Vote_granted = true
+					rf.logger.Println(args.Candidate_id, "RequestVote reply from", me, "F success-TermHigher-UpToDate, args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
+				} else {
+					rf.logger.Println(args.Candidate_id, "RequestVote reply from", me, "F failed-NotUpToDate, args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
+					reply.Vote_granted = false
+				}
+
 				rf.requestVote_reply_chan <- *reply
 
 				// go rf.followerRoutine(args.Term, args.Candidate_id)
 				// return
 				rf.mux.Lock()
-				// fmt.Println(rf.me, "just became follower term:", term)
+				// rf.logger.Println(rf.me, "just became follower term:", term)
 				rf.server_state = 1
 				rf.current_term = args.Term
 				term = args.Term
@@ -252,37 +423,26 @@ func (rf *Raft) followerRoutine(term int, voted_candidate_leader int) {  // Main
 				rf.mux.Unlock()
 				voted_candidate_leader = args.Candidate_id
 			}
-			// fmt.Println(me, "F RequestVote reply to Candidate:", args.Candidate_id, "voted_for:", voted_candidate_leader, "args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
+			// rf.logger.Println(me, "F RequestVote reply to Candidate:", args.Candidate_id, "voted_for:", voted_candidate_leader, "args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
 			ticker = time.NewTicker(getRandomTime())
 
 		case args := <- rf.received_appendEntries_chan:
-			// fmt.Println(me, "Follower RECEIVED HEARTBEAT from:", args.Leader_id, "args.term:", args.Term, "currentTerm:", term)
+			// rf.logger.Println(me, "Follower RECEIVED HEARTBEAT from:", args.Leader_id, "args.term:", args.Term, "currentTerm:", term)
 
 			reply := &AppendEntriesReply{}
 			if args.Term < term {
-				// TODO: Add ||  log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
 				// Leader is outdated
 				reply.Success = false
 				reply.Term = term
 				rf.appendEntries_reply_chan <- *reply
 
 			} else {
-				if args.Log_entries != nil {
-					// not HeartBeat -> Actual Log update
-					// Do additional log checks here
-
-				}
-				reply.Success = true
-				reply.Term = args.Term
-				rf.appendEntries_reply_chan <- *reply
+				HandleAppendEntry(me, term, &args, reply, rf)
 
 				if args.Term > term {
 					// rf needs to store leaderId to redirect clients
-					// go rf.followerRoutine(args.Term, args.Leader_id)
-					// go rf.followerRoutine(args.Term, NULL_INT)
-					// return
 					rf.mux.Lock()
-					// fmt.Println(rf.me, "just became follower term:", term)
+					// rf.logger.Println(rf.me, "just became follower term:", term)
 					rf.server_state = 1
 					rf.current_term = args.Term
 					term = args.Term
@@ -296,7 +456,7 @@ func (rf *Raft) followerRoutine(term int, voted_candidate_leader int) {  // Main
 		// case <- time.After(getRandomTime()):
 		case <-ticker.C:
 			// Election Timed Out //
-			// fmt.Println(me, "F timeout", term)
+			// rf.logger.Println(me, "F timeout", term)
 			go rf.candidateRoutine(term + 1) // Become candidate
 			return
 
@@ -313,11 +473,14 @@ func candidateRequestVotes(requestVote_rpcResult_chan chan RequestVoteReply, ter
 		args.Candidate_id = me
 		args.Term = term
 
-		// fmt.Println(me, "C sending requestVote to", i, "term:", term)
+		args.Last_log_index = get_last_log_id(rf)
+		args.Last_log_term = get_last_log_term(rf)
+
+		// rf.logger.Println(me, "C sending requestVote to", i, "term:", term)
 		go func(peer_id int, args *RequestVoteArgs, requestVote_rpcResult_chan chan RequestVoteReply, ) {
 			reply := &RequestVoteReply{}
 			status := rf.sendRequestVote(peer_id, args, reply)
-			// fmt.Println(me, "RequestVoteRPC reply received1", status, reply.Vote_granted, reply.Voted_for, reply.Term)
+			// rf.logger.Println(me, "RequestVoteRPC reply received1", status, reply.Vote_granted, reply.Voted_for, reply.Term)
 			if status == true {
 				requestVote_rpcResult_chan <- *reply
 			}
@@ -328,7 +491,7 @@ func candidateRequestVotes(requestVote_rpcResult_chan chan RequestVoteReply, ter
 
 func (rf *Raft) candidateRoutine(term int) {
 	rf.mux.Lock()
-	// fmt.Println(rf.me, "just became candidate term:", term)
+	rf.logger.Println(rf.me, "just became candidate term:", term)
 	rf.server_state = 2
 	rf.current_term = term
 
@@ -350,6 +513,7 @@ func (rf *Raft) candidateRoutine(term int) {
 	for {
 		select {
 		case args := <- rf.received_requestVote_chan:
+			// rf.logger.Println(rf.me, "C RequestVote received, term:", args.Term, args.Candidate_id)
 			reply := &RequestVoteReply{}
 
 			if args.Term < term {
@@ -358,8 +522,9 @@ func (rf *Raft) candidateRoutine(term int) {
 				reply.Vote_granted = false
 				reply.Voted_for = NULL_INT // Signify outdated ReqVote
 				rf.requestVote_reply_chan <- *reply
-				// fmt.Println(me, "C RequestVote reply to Candidate:", args.Candidate_id, "voted_for:", rf.voted_for, "args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
-				// fmt.Println(me, "C: Candidate:", args.Candidate_id, "requestVote outdated", args.Term, term)
+				rf.logger.Println(args.Candidate_id, "RequestVote reply from", me, "C falied-lowerTerm, args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
+				// rf.logger.Println(me, "C RequestVote reply to Candidate:", args.Candidate_id, "voted_for:", rf.voted_for, "args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
+				// rf.logger.Println(me, "C: Candidate:", args.Candidate_id, "requestVote outdated", args.Term, term)
 			} else if args.Term == term {
 				// if rf.voted_for == args.Candidate_id {
 				reply.Term = args.Term
@@ -367,31 +532,36 @@ func (rf *Raft) candidateRoutine(term int) {
 				if args.Candidate_id == me {
 					// Replace && true with candidate’s log is at least as up-to-date as receiver's log
 					reply.Vote_granted = true
+					rf.logger.Println(args.Candidate_id, "RequestVote reply from", me, "C success-voteForSelf, args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
 					// voted_candidate_leader = me
-					// fmt.Println(me, "C RequestVote reply to myself: ", "voted_for:", rf.voted_candidate_leader, "args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
+					// rf.logger.Println(me, "C RequestVote reply to myself: ", "voted_for:", rf.voted_candidate_leader, "args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
 				} else {
 					reply.Vote_granted = false // Alr voted for another peer or log is invalid
 					reply.Voted_for = me
-					// fmt.Println(me, "C RequestVote reply to Candidate:", args.Candidate_id, "imVotingForMyself voted_for:", voted_candidate_leader, "args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
+					rf.logger.Println(args.Candidate_id, "RequestVote reply from", me, "C falied-voteForSelf, args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
+					// rf.logger.Println(me, "C RequestVote reply to Candidate:", args.Candidate_id, "imVotingForMyself voted_for:", voted_candidate_leader, "args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
 				}
 				rf.requestVote_reply_chan <- *reply
 			} else {
 				// args.Term > term
 				// TODO check if candidate’s log is at least as up-to-date as receiver's log
-
 				reply.Term = args.Term
-				reply.Vote_granted = true
+				if get_upToDate_check(args, rf) == true {
+					rf.logger.Println(args.Candidate_id, "RequestVote reply from", me, "C success-TermHigher-UpToDate, args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
+					reply.Vote_granted = true
+				} else {
+					rf.logger.Println(args.Candidate_id, "RequestVote reply from", me, "C failed-NotUpToDate, args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
+					reply.Vote_granted = false
+				}
 				rf.requestVote_reply_chan <- *reply
 
-				// fmt.Println(me, "C RequestVote reply to Candidate:", args.Candidate_id, "voted_for:", voted_candidate_leader, ": Reverting to Follower; args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
 				go rf.followerRoutine(args.Term, args.Candidate_id) // convert to follower
 				return
 			}
-
 			// ticker = time.NewTicker(getRandomTime())
 
 		case args := <- rf.received_appendEntries_chan:
-			// fmt.Println(me, "Candidate RECEIVED HEARTBEAT from:", args.Leader_id, "args.term:", args.Term, "currentTerm:", term)
+			rf.logger.Println(me, "Candidate RECEIVED HEARTBEAT from:", args.Leader_id, "args.term:", args.Term, "currentTerm:", term)
 
 			reply := &AppendEntriesReply{}
 			if args.Term < term {
@@ -400,22 +570,10 @@ func (rf *Raft) candidateRoutine(term int) {
 				reply.Term = term
 				rf.appendEntries_reply_chan <- *reply
 			} else {
-				if args.Log_entries != nil {
-					// not HeartBeat -> Actual Log update
-					// Do additional log checks here
-				}
+				HandleAppendEntry(me, term, &args, reply, rf)
 
-				// if args.Term > term {
-				if args.Term >= term {
-					reply.Success = true
-					reply.Term = args.Term
-					rf.appendEntries_reply_chan <- *reply
-
-					// term = args.Term
-					// rf.leader_id = args.Leader_id
-					go rf.followerRoutine(args.Term, args.Leader_id) // convert to follower
-					return
-				}
+				go rf.followerRoutine(args.Term, args.Leader_id) // convert to follower
+				return
 			}
 
 			// ticker = time.NewTicker(getRandomTime())
@@ -423,7 +581,7 @@ func (rf *Raft) candidateRoutine(term int) {
 		// case <- time.After(getRandomTime()):
 		case <-ticker.C:
 			// Election Timed Out //
-			// fmt.Println(me, "C timeout", term)
+			// rf.logger.Println(me, "C timeout", term)
 			// go rf.candidateRoutine(term + 1)
 			// return
 			rf.mux.Lock()
@@ -437,6 +595,7 @@ func (rf *Raft) candidateRoutine(term int) {
 			// voted_candidate_leader := NULL_INT //  Vote for self
 			num_votes_granted = 0
 			requestVote_rpcResult_chan = make(chan RequestVoteReply)
+			rf.logger.Println(me, "C timeout", term)
 			candidateRequestVotes(requestVote_rpcResult_chan, term, me, rf)
 
 
@@ -447,21 +606,21 @@ func (rf *Raft) candidateRoutine(term int) {
 
 			if reply.Term > term {
 				// convert to follower
-				// fmt.Println(me, "C vote failed greater term, currentTerm:", term, "reply term:", reply.Term, "success:", reply.Vote_granted, "Vote Count:", num_votes_granted, "num_peers:", len(rf.peers))
+				// rf.logger.Println(me, "C vote failed greater term, currentTerm:", term, "reply term:", reply.Term, "success:", reply.Vote_granted, "Vote Count:", num_votes_granted, "num_peers:", len(rf.peers))
 				go rf.followerRoutine(reply.Term, NULL_INT) // Set as NULL_INT not leader for now
 				return
 			} else if reply.Term == term {
 				if reply.Vote_granted == true {
 					num_votes_granted += 1
-					// fmt.Println(me, "C vote success, currentTerm:", term, "reply term:", reply.Term, "success:", reply.Vote_granted, "Vote Count:", num_votes_granted, "num_peers:", len(rf.peers))
+					// rf.logger.Println(me, "C vote success, currentTerm:", term, "reply term:", reply.Term, "success:", reply.Vote_granted, "Vote Count:", num_votes_granted, "num_peers:", len(rf.peers))
 					if num_votes_granted > len(rf.peers) / 2 {
 						// Election Succeeded
-						// fmt.Println(me, "Election Success", num_votes_granted, len(rf.peers))
+						// rf.logger.Println(me, "Election Success", num_votes_granted, len(rf.peers))
 						go rf.leaderRoutine(term)
 						return
 					}
 				}
-				// fmt.Println(me, "C vote failed firstcomefirstserve, currentTerm:", term, "reply term:", reply.Term, "success:", reply.Vote_granted, "F/C voted_for:", reply.Voted_for, "Vote Count:", num_votes_granted, "num_peers:", len(rf.peers))
+				// rf.logger.Println(me, "C vote failed firstcomefirstserve, currentTerm:", term, "reply term:", reply.Term, "success:", reply.Vote_granted, "F/C voted_for:", reply.Voted_for, "Vote Count:", num_votes_granted, "num_peers:", len(rf.peers))
 			} else {
 				rf.logger.Panicln("SOMETHING WEIRD HERE: requestVote rpc reply.Term < term", term, reply.Term)
 			}
@@ -472,36 +631,37 @@ func (rf *Raft) candidateRoutine(term int) {
 	}
 }
 
-func sendHeartBeat(appendEntries_rpcResult_chan chan AppendEntriesReply, term int, me int, rf *Raft) {
-	// fmt.Println(me, "Leader sending Heartbeats, term:", term)
-	for i:=0; i < len(rf.peers); i++ {
-		if i != me {
-			args := &AppendEntriesArgs{}
-			args.Leader_id = me
-			args.Term = term
-			args.Log_entries = nil
+// func sendHeartBeat(appendEntries_rpcResult_chan chan AppendEntriesReply, term int, me int, rf *Raft) {
+// 	// rf.logger.Println(me, "Leader sending Heartbeats, term:", term)
+// 	for i:=0; i < len(rf.peers); i++ {
+// 		if i != me {
+// 			args := &AppendEntriesArgs{}
+// 			args.Leader_id = me
+// 			args.Term = term
+// 			args.Log_entries = nil
 
-			// fmt.Println(me, "sending HeartBeat to ", i)
-			go func(peer_id int, args AppendEntriesArgs, appendEntries_rpcResult_chan chan AppendEntriesReply) {
-				reply := &AppendEntriesReply{}
-				status := rf.sendAppendEntries(peer_id, &args, reply)
-				if status == true {
-					appendEntries_rpcResult_chan <- *reply
-				}
-				return
-			}(i, *args, appendEntries_rpcResult_chan)
-		}
-	}
+// 			// rf.logger.Println(me, "sending HeartBeat to ", i)
+// 			go func(peer_id int, args AppendEntriesArgs, appendEntries_rpcResult_chan chan AppendEntriesReply) {
+// 				reply := &AppendEntriesReply{}
+// 				status := rf.sendAppendEntries(peer_id, &args, reply)
+// 				if status == true {
+// 					appendEntries_rpcResult_chan <- *reply
+// 				}
+// 				return
+// 			}(i, *args, appendEntries_rpcResult_chan)
+// 		}
+// 	}
 
-	return
-}
+// 	return
+// }
 
-func sendAppendEntriesAll(appendEntries_rpcResult_chan chan AppendEntriesReply, nextIndices []int, matchIndex []int, term int, me int, rf *Raft) {
-	// fmt.Println(me, "Leader sending Heartbeats, term:", term)
+func sendAppendEntriesAll(appendEntries_rpcResult_chan chan AppendEntriesReply, nextIndices []int, term int, me int, rf *Raft) {
+	// rf.logger.Println(me, "Leader sending Heartbeats, term:", term)
 	last_log_id := get_last_log_id(rf)
 
 	for i:=0; i < len(rf.peers); i++ {
 		if i != me {
+			// rf.logger.Println(me, "sending AppendEntry to ", i)
 			next_index_i := nextIndices[i]
 			args := &AppendEntriesArgs{}
 			args.Leader_id = me
@@ -509,25 +669,41 @@ func sendAppendEntriesAll(appendEntries_rpcResult_chan chan AppendEntriesReply, 
 
 			if last_log_id >= next_index_i {
 				// Send Append LogEntry //
-				args.Log_entries = rf.log_entries[next_index_i:]
-
+				rf.mux.Lock()
+				rf.logger.Println("Next_index_i", next_index_i, "i:", i)
 				if next_index_i == 1 {
 					args.Prev_log_index = NULL_INT // NOTE: Receiver should check if log_index == NULL_INT -> always passes consistentCheck
 					args.Prev_log_term = NULL_INT
 				} else {
 					args.Prev_log_index = next_index_i - 1
-					args.Prev_log_term = rf.log_entries[args.Prev_log_index].term
+					args.Prev_log_term = rf.log_entries[args.Prev_log_index - 1].Term // minus 1 because of 1-indexing
 				}
 
+				/* Init Log Entries to send */
+				// args.Log_entries = make([]LogEntry, len(rf.log_entries[next_index_i - 1:]))
+				// copy(args.Log_entries, rf.log_entries[next_index_i - 1:]) // minus 1 to conver to 0-index
+				// NEW //
+				args.Log_entries = make([]LogEntry, 0)
+				args.Log_entries = rf.log_entries[next_index_i - 1:] // minus 1 to conver to 0-index
+				// for j := next_index_i - 1; j < rf.num_logs; j++ {
+				// 	args.Log_entries[j - next_index_i + 1] = rf.log_entries[j]
+				// }
+				// args.Log_entries_len = rf.num_logs - next_index_i + 1
+				args.Is_heartbeat = false //
+
+
+				rf.mux.Unlock()
 				args.Leader_commit_id = rf.commit_index
+
 			} else {
 				// Send HeartBeat //
-				args.Log_entries = nil
+				// rf.logger.Println(me, "sending HeartBeat to ", i)
+				args.Is_heartbeat = true
 			}
 
-			// fmt.Println(me, "sending HeartBeat to ", i)
 			go func(peer_id int, args AppendEntriesArgs, appendEntries_rpcResult_chan chan AppendEntriesReply) {
 				reply := &AppendEntriesReply{}
+
 				status := rf.sendAppendEntries(peer_id, &args, reply)
 				if status == true {
 					appendEntries_rpcResult_chan <- *reply
@@ -540,41 +716,41 @@ func sendAppendEntriesAll(appendEntries_rpcResult_chan chan AppendEntriesReply, 
 	return
 }
 
-func get_last_log_id(rf *Raft) int {
-	rf.mux.Lock()
-	last_log_id := rf.log_entries[rf.num_logs - 1].index
-	if last_log_id != rf.num_logs {
-		rf.logger.Panicln("last_log_id != rf.num_logs")
-	}
-	rf.mux.Unlock()
-
-	return last_log_id
-}
-
 func (rf *Raft) leaderRoutine(term int) {
 	rf.mux.Lock()
 	rf.current_term = term
-	// fmt.Println(rf.me, "just became leader term:", term)
+	rf.logger.Println(rf.me, "just became leader term:", term)
+	// printLogs(rf.me, rf.log_entries)
 	rf.server_state = 3
 
 	me := rf.me
+	rf.mux.Unlock()
 
 	var nextIndices []int
 	var matchIndices []int
 
+	rf.logger.Println(rf.me, "term:", term, "here0")
 	last_log_id := get_last_log_id(rf)
+	rf.logger.Println(rf.me, "term:", term, "here1")
 
 	for i:=0; i < len(rf.peers); i++ {
-		nextIndices = append(nextIndices, last_log_id + 1)
+		if last_log_id == NULL_INT {
+			nextIndices = append(nextIndices, 1)
+		} else {
+			nextIndices = append(nextIndices, last_log_id + 1)
+		}
 		matchIndices = append(matchIndices, 0)
 	}
 
-	rf.mux.Unlock()
 
+	rf.logger.Println(rf.me, "term:", term, "here2")
 	appendEntries_rpcResult_chan := make(chan AppendEntriesReply)
+	rf.logger.Println(rf.me, "term:", term, "here3")
 
 	// Send Heartbeats /* Send AppendEntries RPC in a new go routine */
-	sendHeartBeat(appendEntries_rpcResult_chan, term, me, rf)
+	sendAppendEntriesAll(appendEntries_rpcResult_chan, nextIndices, term, me, rf)
+	// sendHeartBeat(appendEntries_rpcResult_chan, term, me, rf)
+	rf.logger.Println(rf.me, "term:", term, "here4")
 
 	var ticker *time.Ticker
 	ticker = time.NewTicker(time.Duration(heartbeat_interval) * time.Millisecond)
@@ -582,6 +758,7 @@ func (rf *Raft) leaderRoutine(term int) {
 	for {
 		select {
 		case args := <- rf.received_requestVote_chan:
+			rf.logger.Println(rf.me, "C RequestVote received, term:", args.Term, args.Candidate_id)
 			reply := &RequestVoteReply{}
 
 			if args.Term < term {
@@ -590,40 +767,50 @@ func (rf *Raft) leaderRoutine(term int) {
 				reply.Vote_granted = false
 				reply.Voted_for = 10000 // Signify I am the leader already
 				rf.requestVote_reply_chan <- *reply
-				// fmt.Println(me, "L RequestVote reply to Candidate:", args.Candidate_id, "voted_for:", voted_candidate_leader, "args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
-
+				rf.logger.Println(args.Candidate_id, "RequestVote reply from", me, "L falied-lowerTerm, args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
 
 			} else if args.Term == term {
-				// if (rf.voted_for == NULL_INT || rf.voted_for == args.Candidate_id) && true {
-				// 	// Replace && true with candidate’s log is at least as up-to-date as receiver's log
-
-				// 	rf.voted_for = args.Candidate_id
-
-				// 	reply.Term = args.Term
-				// 	reply.Vote_granted = true
-				// } else {
+				// NOTE: Break Ties by comparing log up-to-date ness
 				reply.Term = args.Term
-				reply.Vote_granted = false // Alr voted for another peer or log is invalid
-				reply.Voted_for = 10000 // Signify I am the leader already
-				// }
-				rf.requestVote_reply_chan <- *reply
-				// fmt.Println(me, "L RequestVote reply to Candidate:", args.Candidate_id, "voted_for:", rf.voted_for, "args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
+				if get_upToDate_check(args, rf) == true {
+					reply.Vote_granted = true
+					rf.requestVote_reply_chan <- *reply
+
+					rf.logger.Println(args.Candidate_id, "RequestVote reply from", me, "L success-EqualTerm-UpToDate, args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
+
+				} else {
+					reply.Vote_granted = false
+					reply.Voted_for = 10000 // Signify I am the leader already
+					rf.requestVote_reply_chan <- *reply
+
+					rf.logger.Println(args.Candidate_id, "RequestVote reply from", me, "L failed-EqualTerm-NotUpToDate, args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
+
+					go rf.followerRoutine(args.Term, args.Candidate_id) // convert to follower
+					return
+				}
+				// rf.logger.Println(me, "L RequestVote reply to Candidate:", args.Candidate_id, "voted_for:", reply.Voted_for, "args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
 
 			} else {
 				// args.Term > term
 				// TODO check if candidate’s log is at least as up-to-date as receiver's log
 				reply.Term = args.Term
-				reply.Vote_granted = true
+				if get_upToDate_check(args, rf) {
+					rf.logger.Println(args.Candidate_id, "RequestVote reply from", me, "L success-HigherTerm-UpToDate, args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
+					reply.Vote_granted = true
+				} else {
+					rf.logger.Println(args.Candidate_id, "RequestVote reply from", me, "L failed-HigherTerm-NotUpToDate, args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
+					reply.Vote_granted = false
+				}
 				rf.requestVote_reply_chan <- *reply
 
-				// fmt.Println(me, "L RequestVote reply to Candidate:", args.Candidate_id, "voted_for:", rf.voted_for, "args term", args.Term, "current_term:", term, "vote granted:", reply.Vote_granted)
-				// fmt.Println(me, "lost leadership to candidate:", args.Candidate_id,"current_term:", term, "candidate term", args.Term)
+				// rf.logger.Println(me, "lost leadership to candidate:", args.Candidate_id,"current_term:", term, "candidate term", args.Term)
 				go rf.followerRoutine(args.Term, args.Candidate_id) // convert to follower
 				return
 			}
 
 		case args := <- rf.received_appendEntries_chan:
-			// fmt.Println(me, "LEADER RECEIVED HEARTBEAT from:", args.Leader_id, "args.term:", args.Term, "currentTerm:", term)
+			rf.logger.Println(me, "LEADER RECEIVED HEARTBEAT from:", args.Leader_id, "args.term:", args.Term, "currentTerm:", term)
+
 			reply := &AppendEntriesReply{}
 			if args.Term < term {
 				// Sender Leader is outdated
@@ -631,26 +818,20 @@ func (rf *Raft) leaderRoutine(term int) {
 				reply.Term = term
 				rf.appendEntries_reply_chan <- *reply
 			} else {
-
-				if args.Log_entries != nil {
-					// not HeartBeat -> Actual Log update
-					// Do additional log checks here
-
-				}
-				reply.Success = true
-				reply.Term = args.Term
-				rf.appendEntries_reply_chan <- *reply
+				HandleAppendEntry(me, term, &args, reply, rf)
 
 				if args.Term > term {
 					// go rf.followerRoutine(args.Term, args.Leader_id) // convert to follower
-					// fmt.Println(me, "lost leadership to another leader:", args.Leader_id,"current_term:", term, "candidate term", args.Term)
+					// rf.logger.Println(me, "lost leadership to another leader:", args.Leader_id,"current_term:", term, "candidate term", args.Term)
 					go rf.followerRoutine(args.Term, NULL_INT) // convert to follower
 					return
 
 				} else if args.Term == term {
 					if args.Leader_id != me {
 						rf.logger.Println("2 Leaders in the same term -> have not decided how to handle", me,  args.Leader_id)
-						// fmt.Println("2 Leaders in the same term -> have not decided how to handle", me,  args.Leader_id)
+						rf.logger.Panicln(me, "LEADER RECEIVED HEARTBEAT from:", args.Leader_id, "args.term:", args.Term, "currentTerm:", term)
+						// Case should never happen -> Handle if it does -> Consider comparing which leader is more up-to-date
+						// rf.logger.Println("2 Leaders in the same term -> have not decided how to handle", me,  args.Leader_id)
 						// if args.Leader_id > me {
 						// 	go rf.candidateRoutine(term + 1)  // Init new Election
 						// 	return
@@ -663,32 +844,113 @@ func (rf *Raft) leaderRoutine(term int) {
 
 		case reply := <- appendEntries_rpcResult_chan:
 			// Received Response from AppendEntries RPC call
-			// fmt.Println(me, "L Heartbeat resp, term:", reply.Term, "success:", reply.Success)
+			// rf.logger.Println(me, "L Heartbeat resp, term:", reply.Term, "success:", reply.Success)
+			rf.logger.Println("leader reply", reply.From, "matchid", reply.New_match_id, "is heartbeat", reply.Is_heartbeat)
 			if reply.Success == false {
 				if reply.Term > term {
 					// Leader is outdated -> update term and switch to Follower
-					// fmt.Println(me, "lost leadership during heartbeat response, current_term:", term, "candidate term", reply.Term)
+					// rf.logger.Println(me, "lost leadership during heartbeat response, current_term:", term, "candidate term", reply.Term)
 					go rf.followerRoutine(reply.Term, NULL_INT)
 					return
 				} else {
-					// Case where log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
-					rf.logger.Println("Peer's prevLogTerm != Peer.log_entries[prevLogIndex]", term, reply.Term, reply.Success)
-					// fmt.Println("Peer's prevLogTerm != Peer.log_entries[prevLogIndex]", term, reply.Term, reply.Success)
-					// rf.logger.Panicln("Peer's prevLogTerm != Peer.log_entries[prevLogIndex]", term, reply.Term, reply.Success)
+					if reply.Is_heartbeat == false {
+						// Case where log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+					rf.logger.Println(rf.me, "L received AppendEntries responds from", reply.From, "failed logInconsistent", term, reply.Term, reply.Success, reply.New_match_id)
+
+					// TODO: decrement nextIndex and retry
+					// decrement nextIndices[i]
+					nextIndices[reply.From] = nextIndices[reply.From] - 1
+					next_index_i := nextIndices[reply.From] // 1-indexed
+
+					// Retry
+					args := &AppendEntriesArgs{}
+					args.Leader_id = me
+					args.Term = term
+
+					// Make sure next_index_i <= last_log_id
+					if next_index_i == 1 {
+						args.Prev_log_index = NULL_INT // NOTE: Receiver should check if log_index == NULL_INT -> always passes consistentCheck
+						args.Prev_log_term = NULL_INT
+					} else {
+						args.Prev_log_index = next_index_i - 1
+						rf.mux.Lock()
+						args.Prev_log_term = rf.log_entries[args.Prev_log_index - 1].Term // minus 1 because of 1-indexing
+						rf.mux.Unlock()
+					}
+
+					rf.mux.Lock()
+					/* Init Log Entries to send */
+					args.Log_entries = make([]LogEntry, len(rf.log_entries[next_index_i - 1:]))
+					copy(args.Log_entries, rf.log_entries[next_index_i - 1:]) // minus 1 to conver to 0-index
+					// for j := next_index_i - 1; j < rf.num_logs; j++ {
+					// 	args.Log_entries[j - next_index_i - 1] = rf.log_entries[j]
+					// }
+					// args.Log_entries_len = rf.num_logs - next_index_i + 1
+					// args.Is_heartbeat = false //
+					rf.mux.Unlock()
+					args.Leader_commit_id = rf.commit_index
+
+					go func(peer_id int, args AppendEntriesArgs, appendEntries_rpcResult_chan chan AppendEntriesReply) {
+						reply := &AppendEntriesReply{}
+						status := rf.sendAppendEntries(peer_id, &args, reply)
+						if status == true {
+							appendEntries_rpcResult_chan <- *reply
+						}
+						return
+					}(reply.From, *args, appendEntries_rpcResult_chan) //
+				}
+			}
+
+			} else {
+
+				if reply.Is_heartbeat == false {
+					rf.logger.Println(rf.me, "L received AppendEntries non-HB response from", reply.From, "Success", term, reply.Term, "match_id", reply.New_match_id)
+					/*
+					1. Update nextIndex and matchIndex for follower
+					2. Update Commit Index
+						If there exists an N such that N > commitIndex, a majority
+						of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+						set commitIndex = N
+					3. if commit index > last applied -> Apply and send to client
+					*/
+
+					// 1. Update nextIndex and matchIndex for follower
+					nextIndices[reply.From] = reply.New_match_id + 1 // To ASK
+					matchIndices[reply.From] = reply.New_match_id // To ASK
+
+					last_log_id := get_last_log_id(rf)
+
+					for log_id := rf.commit_index + 1; log_id <= last_log_id; log_id++ {
+						num_peers_commited_i := 0
+						// Check if a majority of matchIndex[i] ≥ N
+						for j := 0; j < len(rf.peers); j++ {
+							if matchIndices[j] >= log_id {
+								num_peers_commited_i += 1
+							}
+						}
+						rf.logger.Println("matchIndex for log", log_id, "num peer commited", num_peers_commited_i)
+						if num_peers_commited_i > ((len(rf.peers) / 2) - 1) { // minus 1 because we aren't counting leader himself
+							// Check if log[N].term == currentTerm
+							rf.mux.Lock()
+							log_i := rf.log_entries[log_id - 1] // minus 1 for 1-indexing
+							rf.mux.Unlock()
+							if log_i.Term == term {
+								apply_command := &ApplyCommand{log_i.Index, log_i.Command}
+								rf.applyCh <- *apply_command
+
+								rf.commit_index = log_id
+								rf.last_applied = log_id
+							}
+						}
+					}
 				}
 			}
 
 		// case <- time.After(time.Duration(heartbeat_interval) * time.Millisecond):
 		case <-ticker.C:
-			// Send Heartbeats
-			// appendEntries_rpcResult_chan := make(chan AppendEntriesReply)
-			// for i:=0; i < len(rf.peers); i++ {
-			// 	/* Send AppendEntries RPC in a new go routine */
-			// 	sendHeartBeat(appendEntries_rpcResult_chan, term, me, rf)
-			// }
-			// Send Heartbeats /* Send AppendEntries RPC in a new go routine */
-			sendHeartBeat(appendEntries_rpcResult_chan, term, me, rf)
-
+			// Send AppendEntries
+			sendAppendEntriesAll(appendEntries_rpcResult_chan, nextIndices, term, me, rf)
+			// sendHeartBeat(appendEntries_rpcResult_chan, term, me, rf)
 			// ticker = time.NewTicker(time.Duration(heartbeat_interval) * time.Millisecond)
 
 		case <- rf.close_mainRoutine_chan:
@@ -721,15 +983,15 @@ func (rf *Raft) GetState() (int, int, bool) {
 		isLeader = false
 	}
 
-	// fmt.Println("GET STATE RESULTS:", me, current_term, isLeader)
+	// rf.logger.Println("GET STATE RESULTS:", me, current_term, isLeader)
 
 	return me, current_term, isLeader
 }
 
 
 type LogEntry struct {
-	index 	int  // might need this if we need 1-indexing
-	term		int
+	Index 	int  // might need this if we need 1-indexing
+	Term		int
 	Command interface{}
 }
 
@@ -742,13 +1004,18 @@ type LogEntry struct {
 // Field names must start with capital letters!
 type AppendEntriesArgs struct {
 	// Your data here (2A, 2B)
-	Term	int
-	Leader_id	int
+	Term				int
+	Leader_id			int
 
 	Prev_log_index		int
 	Prev_log_term		int
 
+	// Log_entries			[MAX_ARG_LOG_ENTRIES]LogEntry
 	Log_entries			[]LogEntry
+	// Log_entries			LogEntry
+	// Log_entries_len		int
+	Is_heartbeat		bool
+
 	Leader_commit_id	int
 }
 
@@ -763,6 +1030,11 @@ type AppendEntriesReply struct {
 	// Your data here (2A)
 	Term			int	 // currentTerm for L to update itself
 	Success			bool // True if follower contained entry matching prevLogIndex and prevLogTerm
+	From			int  // server index providing reply
+
+	New_match_id	int	// 1-indexed, NULL_INT if not applicable
+	Is_heartbeat	bool
+	//
 }
 
 
@@ -774,15 +1046,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	1. Reply false if term < currentTerm
 	2.
 	*/
+	// rf.mux.Lock()
+	// me := rf.me
+	// rf.mux.Unlock()
+
+	// rf.logger.Println(me, "In APpendEntires handler log_len", len(args.Log_entries))
+	// printLogs(me, (*args).Log_entries[:], len(args.Log_entries))
 	rf.received_appendEntries_chan <- *args
 	server_reply := <- rf.appendEntries_reply_chan
 
 	reply.Term = server_reply.Term
 	reply.Success = server_reply.Success
+	reply.From = server_reply.From
+	reply.New_match_id = server_reply.New_match_id
+	reply.Is_heartbeat = server_reply.Is_heartbeat
 	return
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	// rf.logger.Println("L printing logs to send to ", server, "arg log len:", len(args.Log_entries))
+	// printLogs(1, args.Log_entries[:], len(args.Log_entries)) // Still okay here
+	// rf.logger.Println(me, "L printing logs to send to ", i)
+	// printLogs(me , args.Log_entries[:], args.Log_entries_len)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -829,13 +1114,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	2. If votedFor is null or candidateId, and candidate’s log is at
 	least as up-to-date as receiver’s log, grant vote
 	*/
-	// fmt.Println(rf.me, "RequestVoteRPC handler called", "from:", args.Candidate_id, "term:", args.Term)
+	// rf.logger.Println(rf.me, "RequestVoteRPC handler called", "from:", args.Candidate_id, "term:", args.Term)
 	rf.received_requestVote_chan <- *args
-	// fmt.Println(rf.me, "RV RPC 2")
+	// rf.logger.Println(rf.me, "RV RPC 2")
 	server_reply := <-rf.requestVote_reply_chan
 
 	reply.Term = server_reply.Term
 	reply.Vote_granted = server_reply.Vote_granted
+	reply.Voted_for = server_reply.Voted_for
 
 	return
 }
@@ -930,13 +1216,15 @@ func (rf *Raft) PutCommand(command interface{}) (int, int, bool) {
 		// Get index for new log entry
 		new_log_id := len(rf.log_entries) + 1
 
-		new_log := &LogEntry{new_log_id, current_term, command}
+		new_log := LogEntry{new_log_id, current_term, command}
 
-		rf.log_entries = append(rf.log_entries, *new_log)
+		rf.log_entries = append(rf.log_entries, new_log)
 		rf.num_logs += 1
 
+		rf.logger.Println(rf.me, "L receiving PutCommand term:", current_term, "index",  new_log_id, "command", command)
+		// printLogs(rf.me, rf.log_entries)
 		rf.mux.Unlock()
-		return new_log_id, current_term, false
+		return new_log_id, current_term, true
 	}
 }
 
@@ -985,7 +1273,8 @@ func NewPeer(peers []*rpc.ClientEnd, me int, applyCh chan ApplyCommand) *Raft {
 
 	if kEnableDebugLogs {
 		peerName := peers[me].String()
-		logPrefix := fmt.Sprintf("%s ", peerName)
+		// logPrefix := fmt.Sprintf("%s ", peerName)
+		logPrefix := fmt.Sprintf("%d_server", me)
 		if kLogToStdout {
 			rf.logger = log.New(os.Stdout, peerName, log.Lmicroseconds|log.Lshortfile)
 		} else {
