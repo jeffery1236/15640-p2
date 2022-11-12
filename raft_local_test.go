@@ -163,30 +163,6 @@ func TestSmallPartitionNoConsensus2A(t *testing.T) {
 	fmt.Printf("======================= END =======================\n\n")
 }
 
-func TestBasicAgree2B(t *testing.T) {
-	fmt.Printf("==================== 5 SERVERS ====================\n")
-	servers := 5
-	cfg := make_config(t, servers, false)
-	defer cfg.cleanup()
-
-	fmt.Printf("Test (2B): basic agreement\n")
-
-	iters := 3
-	for index := 1; index < iters+1; index++ {
-		nd, _ := cfg.nCommitted(index)
-		if nd > 0 {
-			t.Fatalf("Some have committed before PutCommand()")
-		}
-
-		xindex := cfg.one(index*100, servers)
-		if xindex != index {
-			t.Fatalf("Got index %v but expected %v", xindex, index)
-		}
-	}
-
-	fmt.Printf("======================= END =======================\n\n")
-}
-
 func TestLargePartitionConsensus2A(t *testing.T) {
 	// go test -run=TestLargePartitionConsensus2A -timeout=60s -race -v -count 5
 	fmt.Printf("==================== 11 SERVERS ====================\n")
@@ -307,6 +283,31 @@ func TestLargePartitionNoConsensus2A(t *testing.T) {
 
 /* ============================= END 2A =================================== */
 
+func TestBasicAgree2B(t *testing.T) {
+	fmt.Printf("==================== 5 SERVERS ====================\n")
+	servers := 5
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Test (2B): basic agreement\n")
+
+	iters := 3
+	for index := 1; index < iters+1; index++ {
+		nd, _ := cfg.nCommitted(index)
+		if nd > 0 {
+			t.Fatalf("Some have committed before PutCommand()")
+		}
+
+		fmt.Println("testing index", index)
+		xindex := cfg.one(index*100, servers)
+		if xindex != index {
+			t.Fatalf("Got index %v but expected %v", xindex, index)
+		}
+	}
+
+	fmt.Printf("======================= END =======================\n\n")
+}
+
 func TestFailAgree2B(t *testing.T) {
 	fmt.Printf("==================== 3 SERVERS ====================\n")
 	servers := 3
@@ -325,14 +326,16 @@ func TestFailAgree2B(t *testing.T) {
 	fmt.Printf("Checking agreement with one disconnected peer\n")
 	// agree despite two disconnected servers?
 	cfg.one(102, servers-1)
+	fmt.Printf("Checking agreement with one disconnected peer1\n")
 	cfg.one(103, servers-1)
+	fmt.Printf("Checking agreement with one disconnected peer2\n")
 	time.Sleep(RaftElectionTimeout)
 	cfg.one(104, servers-1)
 	cfg.one(105, servers-1)
 
 	// re-connect
 	cfg.connect((leader + 1) % servers)
-	fmt.Printf("Checking with one reconnected server\n")
+	fmt.Printf("Checking with one reconnected server %d\n", leader + 1)
 	// agree with full set of servers?
 	cfg.one(106, servers)
 	time.Sleep(RaftElectionTimeout)
@@ -400,7 +403,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	fmt.Printf("======================= END =======================\n\n")
 }
 
-func TestConcurrentPutCommands2B(t *testing.T) {
+func TestConcurrentPutCommands2C(t *testing.T) {
 	fmt.Printf("==================== 3 SERVERS ====================\n")
 	servers := 3
 	cfg := make_config(t, servers, false)
@@ -960,13 +963,15 @@ func (cfg *config) one(cmd int, expectedServers int) int {
 				}
 			}
 		}
-
+		fmt.Println("FOund leader; log index", index)
 		if index != -1 {
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+				cmd2, ok := cmd1.(int)
+				fmt.Println("One: looking for commited cmd", cmd, ok, cmd2, "num commited", nd, "expectedServers", expectedServers)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd2, ok := cmd1.(int); ok && cmd2 == cmd {

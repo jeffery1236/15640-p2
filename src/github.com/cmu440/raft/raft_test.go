@@ -26,7 +26,7 @@ const RaftElectionTimeout = 1000 * time.Millisecond
 type IntSet = map[int]struct{}
 
 func TestInitialElection2A(t *testing.T) {
-	fmt.Printf("==================== 3 SERVERS ====================\n")
+	fmt.Printf("==================== 3 SERVERS TestInitialElection2A ====================\n")
 	servers := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -740,6 +740,7 @@ func (cfg *config) one(cmd int, expectedServers int) int {
 				nd, cmd1 := cfg.nCommitted(index)
 				if nd > 0 && nd >= expectedServers {
 					// committed
+					cmd2, ok := cmd1.(int)
 					if cmd2, ok := cmd1.(int); ok && cmd2 == cmd {
 						// and it was the command we submitted.
 						return index
